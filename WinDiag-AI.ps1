@@ -13,30 +13,74 @@
 #Requires -Version 5.1
 
 #region Admin + STA Guard
+# Debug: show what PS sees (visible in console before GUI opens)
+Write-Host "WinDiag-AI starting..." -ForegroundColor Cyan
+Write-Host "  PSCommandPath    : $PSCommandPath" -ForegroundColor DarkGray
+Write-Host "  MyCommand.Path   : $($MyInvocation.MyCommand.Path)" -ForegroundColor DarkGray
+Write-Host "  PSScriptRoot     : $PSScriptRoot" -ForegroundColor DarkGray
+Write-Host "  PWD              : $($PWD.Path)" -ForegroundColor DarkGray
+$_ScriptPath = $null
+# Method 1: PSCommandPath — set by PowerShell when launched with -File or Run with PowerShell
+if(-not $_ScriptPath -and $PSCommandPath -and $PSCommandPath -ne '' -and (Test-Path $PSCommandPath -EA SilentlyContinue)){
+    $_ScriptPath = $PSCommandPath
+}
+# Method 2: MyInvocation.MyCommand.Path — reliable in PS5.1 -File launches
+if(-not $_ScriptPath -and $MyInvocation.MyCommand.Path -and (Test-Path $MyInvocation.MyCommand.Path -EA SilentlyContinue)){
+    $_ScriptPath = $MyInvocation.MyCommand.Path
+}
+# Method 3: MyInvocation.MyCommand.Source
+if(-not $_ScriptPath -and $MyInvocation.MyCommand.Source -and (Test-Path $MyInvocation.MyCommand.Source -EA SilentlyContinue)){
+    $_ScriptPath = $MyInvocation.MyCommand.Source
+}
+# Method 4: PSScriptRoot + script name
+if(-not $_ScriptPath -and $PSScriptRoot -and $PSScriptRoot -ne ''){
+    $t = Join-Path $PSScriptRoot "WinDiag-AI.ps1"
+    if(Test-Path $t -EA SilentlyContinue){ $_ScriptPath = $t }
+}
+# Method 5: Search PWD and parent
+if(-not $_ScriptPath){
+    foreach($sp in @($PWD.Path, (Split-Path $PWD.Path -Parent))){
+        if($sp){ $t = Join-Path $sp "WinDiag-AI.ps1"; if(Test-Path $t -EA SilentlyContinue){ $_ScriptPath = $t; break } }
+    }
+}
+
+$_ScriptDir = if($_ScriptPath){ Split-Path $_ScriptPath -Parent } else { $PWD.Path }
+$_PSExe = (Get-Command powershell.exe -EA SilentlyContinue).Source
+if(-not $_PSExe){ $_PSExe = (Get-Command pwsh -EA SilentlyContinue).Source }
+
+# Elevate to Admin if needed
 try {
     $cp = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-    if (-not $cp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        $s = $PSCommandPath; if(-not $s){$s=$MyInvocation.MyCommand.Path}
-        if ($s) { $ps = (Get-Command powershell.exe -EA SilentlyContinue).Source; if(-not $ps){$ps=(Get-Command pwsh -EA SilentlyContinue).Source}
-            if($ps){Start-Process $ps @("-NoProfile","-STA","-ExecutionPolicy","Bypass","-File",$s) -Verb RunAs; exit} }
+    if(-not $cp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
+        if($_ScriptPath -and $_PSExe){
+            # Use -File with quoted path (handles spaces). -File preserves $PSCommandPath/$PSScriptRoot in child.
+            Start-Process $_PSExe `
+                -ArgumentList "-NoProfile","-STA","-ExecutionPolicy","Bypass","-File",('"{0}"' -f $_ScriptPath) `
+                -Verb RunAs -WorkingDirectory $_ScriptDir
+            exit
+        }
     }
 } catch {}
+# Ensure STA apartment state (only needed if already elevated but wrong apartment)
 try {
-    if ([Threading.Thread]::CurrentThread.ApartmentState -ne "STA") {
-        $s = $PSCommandPath; if(-not $s){$s=$MyInvocation.MyCommand.Path}
-        if ($s) { $ps = (Get-Command powershell.exe -EA SilentlyContinue).Source; if(-not $ps){$ps=(Get-Command pwsh -EA SilentlyContinue).Source}
-            if($ps){Start-Process $ps @("-NoProfile","-STA","-ExecutionPolicy","Bypass","-File",$s) -Verb RunAs; exit} }
+    if([Threading.Thread]::CurrentThread.ApartmentState -ne "STA"){
+        if($_ScriptPath -and $_PSExe){
+            Start-Process $_PSExe `
+                -ArgumentList "-NoProfile","-STA","-ExecutionPolicy","Bypass","-File",('"{0}"' -f $_ScriptPath) `
+                -Verb RunAs -WorkingDirectory $_ScriptDir
+            exit
+        }
     }
 } catch {}
-try { if($PSCommandPath){Unblock-File $PSCommandPath -EA SilentlyContinue} } catch {}
+try { if($_ScriptPath){ Unblock-File $_ScriptPath -EA SilentlyContinue } } catch {}
 #endregion
 
 #region Globals
 $ErrorActionPreference = "Continue"
 $AppName = "WinDiag-AI"; $AppVer = "3.0"
 
-# Determine script folder for default paths
-$Global:ScriptDir = if($PSCommandPath){Split-Path $PSCommandPath -Parent}elseif($MyInvocation.MyCommand.Path){Split-Path $MyInvocation.MyCommand.Path -Parent}else{$PWD.Path}
+# ScriptDir — reuse what we already resolved above
+$Global:ScriptDir = $_ScriptDir
 
 $Global:OllamaUrl = "http://localhost:11434"
 $Script:Verbose = $false
