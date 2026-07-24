@@ -13,74 +13,38 @@
 #Requires -Version 5.1
 
 #region Admin + STA Guard
-# Debug: show what PS sees (visible in console before GUI opens)
-Write-Host "WinDiag-AI starting..." -ForegroundColor Cyan
-Write-Host "  PSCommandPath    : $PSCommandPath" -ForegroundColor DarkGray
-Write-Host "  MyCommand.Path   : $($MyInvocation.MyCommand.Path)" -ForegroundColor DarkGray
-Write-Host "  PSScriptRoot     : $PSScriptRoot" -ForegroundColor DarkGray
-Write-Host "  PWD              : $($PWD.Path)" -ForegroundColor DarkGray
-$_ScriptPath = $null
-# Method 1: PSCommandPath — set by PowerShell when launched with -File or Run with PowerShell
-if(-not $_ScriptPath -and $PSCommandPath -and $PSCommandPath -ne '' -and (Test-Path $PSCommandPath -EA SilentlyContinue)){
-    $_ScriptPath = $PSCommandPath
-}
-# Method 2: MyInvocation.MyCommand.Path — reliable in PS5.1 -File launches
-if(-not $_ScriptPath -and $MyInvocation.MyCommand.Path -and (Test-Path $MyInvocation.MyCommand.Path -EA SilentlyContinue)){
-    $_ScriptPath = $MyInvocation.MyCommand.Path
-}
-# Method 3: MyInvocation.MyCommand.Source
-if(-not $_ScriptPath -and $MyInvocation.MyCommand.Source -and (Test-Path $MyInvocation.MyCommand.Source -EA SilentlyContinue)){
-    $_ScriptPath = $MyInvocation.MyCommand.Source
-}
-# Method 4: PSScriptRoot + script name
-if(-not $_ScriptPath -and $PSScriptRoot -and $PSScriptRoot -ne ''){
-    $t = Join-Path $PSScriptRoot "WinDiag-AI.ps1"
-    if(Test-Path $t -EA SilentlyContinue){ $_ScriptPath = $t }
-}
-# Method 5: Search PWD and parent
-if(-not $_ScriptPath){
-    foreach($sp in @($PWD.Path, (Split-Path $PWD.Path -Parent))){
-        if($sp){ $t = Join-Path $sp "WinDiag-AI.ps1"; if(Test-Path $t -EA SilentlyContinue){ $_ScriptPath = $t; break } }
-    }
-}
+# Get script path - must be in script scope, not inside a function
+$_self = $MyInvocation.MyCommand.Path
+if(-not $_self){ $_self = $PSCommandPath }
+if(-not $_self -and $PSScriptRoot){ $_self = Join-Path $PSScriptRoot "WinDiag-AI.ps1" }
 
-$_ScriptDir = if($_ScriptPath){ Split-Path $_ScriptPath -Parent } else { $PWD.Path }
-$_PSExe = (Get-Command powershell.exe -EA SilentlyContinue).Source
-if(-not $_PSExe){ $_PSExe = (Get-Command pwsh -EA SilentlyContinue).Source }
+Write-Host "WinDiag-AI | Path: $_self | Admin: $([bool]([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))" -ForegroundColor Cyan
 
-# Elevate to Admin if needed
-try {
-    $cp = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-    if(-not $cp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
-        if($_ScriptPath -and $_PSExe){
-            # Use -File with quoted path (handles spaces). -File preserves $PSCommandPath/$PSScriptRoot in child.
-            Start-Process $_PSExe `
-                -ArgumentList "-NoProfile","-STA","-ExecutionPolicy","Bypass","-File",('"{0}"' -f $_ScriptPath) `
-                -Verb RunAs -WorkingDirectory $_ScriptDir
-            exit
-        }
+if($_self -and (Test-Path $_self)){
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $isSTA   = [Threading.Thread]::CurrentThread.ApartmentState -eq "STA"
+
+    if(-not $isAdmin -or -not $isSTA){
+        $arg = "-NoProfile -STA -ExecutionPolicy Bypass -File `"$_self`""
+        Start-Process powershell.exe -ArgumentList $arg -Verb RunAs
+        exit
     }
-} catch {}
-# Ensure STA apartment state (only needed if already elevated but wrong apartment)
-try {
-    if([Threading.Thread]::CurrentThread.ApartmentState -ne "STA"){
-        if($_ScriptPath -and $_PSExe){
-            Start-Process $_PSExe `
-                -ArgumentList "-NoProfile","-STA","-ExecutionPolicy","Bypass","-File",('"{0}"' -f $_ScriptPath) `
-                -Verb RunAs -WorkingDirectory $_ScriptDir
-            exit
-        }
-    }
-} catch {}
-try { if($_ScriptPath){ Unblock-File $_ScriptPath -EA SilentlyContinue } } catch {}
+}
+try { if($_self){ Unblock-File $_self -EA SilentlyContinue } } catch {}
 #endregion
 
 #region Globals
 $ErrorActionPreference = "Continue"
 $AppName = "WinDiag-AI"; $AppVer = "3.0"
 
-# ScriptDir — reuse what we already resolved above
-$Global:ScriptDir = $_ScriptDir
+# ScriptDir — from $_self resolved in Admin guard above
+$Global:ScriptDir = if($_self -and (Test-Path $_self -EA SilentlyContinue)){
+    Split-Path $_self -Parent
+} elseif($PSScriptRoot -and $PSScriptRoot -ne ''){
+    $PSScriptRoot
+} else {
+    $PWD.Path
+}
 
 $Global:OllamaUrl = "http://localhost:11434"
 $Script:Verbose = $false
@@ -904,7 +868,9 @@ function Start-BackgroundJob {
                          if($EE -and $EE.BSOD){
                              $bsodArr = @($EE.BSOD)
                              $bsodReal = @($bsodArr | Where-Object { $_.Type -eq "BSOD" -or $_.Type -eq "MiniDump" -or $_.Type -eq "FullDump" })
+                             $bsodUnexp = @($bsodArr | Where-Object { $_.Type -eq "UnexpectedShutdown" })
                              if($bsodReal.Count -gt 0){ Ui-Log "BSOD crashes found: $($bsodReal.Count)" "WARN"; foreach($b in ($bsodReal|Select-Object -First 5)){Ui-Log "  - [$($b.Time)] $($b.Type): $($b.Info.Substring(0,[Math]::Min(80,$b.Info.Length)))" "WARN"} }
+                             elseif($bsodUnexp.Count -gt 0){ Ui-Log "No BSODs but $($bsodUnexp.Count) unexpected shutdowns found" "WARN"; foreach($b in ($bsodUnexp|Select-Object -First 3)){Ui-Log "  - [$($b.Time)] $($b.Info)" "WARN"} }
                              else{ Ui-Log "No BSOD crashes detected" "OK" }
                          }
                          # RAM test summary
@@ -982,10 +948,25 @@ $ScanWorkerScript = {
     # ── Hardware ──
     if($DoHardware){
         QLog "Hardware details..." "SCAN"
-        $ram = Get-CimInstance Win32_PhysicalMemory | ForEach-Object { "$($_.BankLabel) $([math]::Round($_.Capacity/1MB))MB $($_.PartNumber)" }
-        $gpu = Get-CimInstance Win32_VideoController | ForEach-Object { "$($_.Name) $([math]::Round($_.AdapterRAM/1MB))MB" }
-        $diag.Hardware = @{ RAM=($ram-join " | "); GPU=($gpu-join " | ") }
+        $ram = Get-CimInstance Win32_PhysicalMemory | ForEach-Object {
+            $bank = if($_.BankLabel -and $_.BankLabel.Trim()){$_.BankLabel}elseif($_.DeviceLocator){$_.DeviceLocator}else{"Slot"}
+            $part = if($_.PartNumber){$_.PartNumber.Trim()}else{""}
+            "$bank $([math]::Round($_.Capacity/1MB))MB$(if($part){' '+$part})"
+        }
+        $gpu = Get-CimInstance Win32_VideoController | ForEach-Object {
+            $vram = if($_.AdapterRAM -and $_.AdapterRAM -gt 0){"$([math]::Round($_.AdapterRAM/1MB))MB"}else{""}
+            "$($_.Name)$(if($vram){' '+$vram})"
+        }
+        $ramSlots = (Get-CimInstance Win32_PhysicalMemoryArray -EA SilentlyContinue | Select-Object -First 1).MemoryDevices
+        $ramSpeed = (Get-CimInstance Win32_PhysicalMemory | Select-Object -First 1).Speed
+        $diag.Hardware = @{
+            RAM        = if($ram){$ram -join " | "}else{"N/A"}
+            GPU        = if($gpu){$gpu -join " | "}else{"N/A"}
+            RAMSlots   = if($ramSlots){"$ramSlots slots"}else{"N/A"}
+            RAMSpeed   = if($ramSpeed){"$ramSpeed MHz"}else{"N/A"}
+        }
         QDbg "RAM: $($diag.Hardware.RAM)"
+        QDbg "GPU: $($diag.Hardware.GPU)"
         QLog "Done" "OK"
     }
 
@@ -1424,19 +1405,71 @@ $ScanWorkerScript = {
         $diag.ChkdskLogs = @()
         try{
             $chkEntries = @()
-            try{$chkEntries += Get-WinEvent -LogName "Microsoft-Windows-Chkdsk/Operational" -MaxEvents 10 -EA Stop}catch{}
-            try{$chkEntries += Get-WinEvent -FilterHashtable @{LogName='Application';Id=1001} -MaxEvents 10 -EA Stop | Where-Object{$_.ProviderName -match 'wininit|Wininit'}}catch{}
-            if($chkEntries.Count -gt 0){
-                $chkEntries | Sort-Object TimeCreated -Descending | Select-Object -First 10 | ForEach-Object {
-                    $msg = if($_.Message){($_.Message -replace '\r?\n',' ')}else{"(no message)"}
-                    if($msg.Length -gt 300){$msg=$msg.Substring(0,300)}
-                    $diag.ChkdskLogs += @{Time=$_.TimeCreated.ToString("yyyy-MM-dd HH:mm");Message=$msg}
-                }
+
+            # Method 1: XPath with correct full provider name (Microsoft-Windows-Wininit)
+            try{
+                $xq = "<QueryList><Query Id='0' Path='Application'><Select Path='Application'>*[System[Provider[@Name='Microsoft-Windows-Wininit']]]</Select></Query></QueryList>"
+                $m1 = @(Get-WinEvent -FilterXml $xq -MaxEvents 20 -EA Stop)
+                QDbg "XPath/Microsoft-Windows-Wininit: $($m1.Count) entries"
+                if($m1.Count -gt 0){ $chkEntries += $m1 }
+            }catch{ QDbg "XPath Microsoft-Windows-Wininit failed: $($_.Exception.Message)" }
+
+            # Method 1b: Also try short name 'Wininit' (older Windows versions)
+            if($chkEntries.Count -eq 0){
+                try{
+                    $xq2 = "<QueryList><Query Id='0' Path='Application'><Select Path='Application'>*[System[Provider[@Name='Wininit']]]</Select></Query></QueryList>"
+                    $m1b = @(Get-WinEvent -FilterXml $xq2 -MaxEvents 20 -EA Stop)
+                    QDbg "XPath/Wininit: $($m1b.Count) entries"
+                    if($m1b.Count -gt 0){ $chkEntries += $m1b }
+                }catch{ QDbg "XPath Wininit failed: $($_.Exception.Message)" }
             }
-            QLog "$(@($diag.ChkdskLogs).Count) entries" "OK"
-        }catch{QLog "Could not read chkdsk logs" "WARN"}
+
+            # Method 2: FilterHashtable ID=1001 + post-filter for both provider names
+            if($chkEntries.Count -eq 0){
+                try{
+                    $m2all = @(Get-WinEvent -FilterHashtable @{LogName='Application';Id=1001} -MaxEvents 300 -EA Stop)
+                    $m2 = @($m2all | Where-Object { $_.ProviderName -match 'Wininit' })
+                    QDbg "FilterHashtable/1001: total=$($m2all.Count) Wininit=$($m2.Count)"
+                    if($m2.Count -gt 0){ $chkEntries += $m2 }
+                    if($m2.Count -eq 0 -and $m2all.Count -gt 0){
+                        QDbg "Providers in ID=1001: $(($m2all | Group-Object ProviderName | ForEach-Object{$_.Name+':'+$_.Count}) -join ', ')"
+                    }
+                }catch{ QDbg "FilterHashtable/1001 failed: $($_.Exception.Message)" }
+            }
+
+            # Method 3: Chkdsk/Operational log
+            if($chkEntries.Count -eq 0){
+                try{
+                    $m3 = @(Get-WinEvent -LogName "Microsoft-Windows-Chkdsk/Operational" -MaxEvents 20 -EA Stop)
+                    QDbg "Chkdsk/Operational: $($m3.Count) entries"
+                    if($m3.Count -gt 0){ $chkEntries += $m3 }
+                }catch{ QDbg "Chkdsk/Operational not found" }
+            }
+
+            if($chkEntries.Count -gt 0){
+                $seen = @{}
+                $chkEntries | Sort-Object TimeCreated -Descending | Select-Object -First 15 | ForEach-Object {
+                    $key = $_.TimeCreated.ToString('yyyyMMddHHmm')
+                    if(-not $seen[$key]){
+                        $seen[$key] = $true
+                        $msg = if($_.Message){$_.Message.Trim()}else{"(no message)"}
+                        if($msg.Length -gt 3000){ $msg = $msg.Substring(0,3000) + "..." }
+                        $diag.ChkdskLogs += @{
+                            Time     = $_.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss")
+                            Provider = $_.ProviderName
+                            EventID  = $_.Id
+                            Message  = $msg
+                        }
+                    }
+                }
+                QLog "$(@($diag.ChkdskLogs).Count) chkdsk entries found" "OK"
+            } else {
+                QLog "No chkdsk logs found" "INFO"
+            }
+        }catch{ QLog "Chkdsk logs error: $($_.Exception.Message)" "WARN" }
     }
 
+    # -- Battery Report --
     # ── Battery Report (powercfg) ──
     if($DoBatteryReport){
         QLog "Battery report (powercfg)..." "SCAN"
@@ -1533,7 +1566,7 @@ $ScanWorkerScript = {
             if(Test-Path $miniDumpPath){
                 $dumps = Get-ChildItem $miniDumpPath -Filter "*.dmp" -EA SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 10
                 foreach($d in $dumps){
-                    $diag.BSOD += @{Type="MiniDump";Info="$($d.Name) ($([math]::Round($d.Length/1KB,0)) KB)";Time=$d.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")}
+                    $diag.BSOD += @{Type="MiniDump";Info="$($d.Name) ($([math]::Round($d.Length/1024,0)) KB)";Time=$d.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss")}
                 }
                 QDbg "Minidumps: $($dumps.Count) files"
             }
@@ -2040,8 +2073,12 @@ $btnReport.Add_Click({
         $updRows=""
         foreach($u in $updatesArr){$updRows+="<tr><td>$([System.Web.HttpUtility]::HtmlEncode($u.Title))</td><td>$($u.KB)</td><td>$($u.Severity)</td></tr>"}
 
-        $battSec=if($D.Battery.Status -and $D.Battery.Status -ne "N/A"){"<details class='sec' open><summary><h2>&#x1F50B; Battery</h2></summary><table class='kv'>$batteryHtml</table></details>"}else{""}
-        $hwSec=if($D.Hardware.RAM -or $D.Hardware.GPU){"<details class='sec' open><summary><h2>&#x1F4BB; Hardware</h2></summary><table class='kv'>$hardwareHtml</table></details>"}else{""}
+        $battSec = if($D.Battery -and $D.Battery.Status){
+            "<details class='sec'><summary><h2>&#x1F50B; Battery</h2></summary><table class='kv'>$batteryHtml</table></details>"
+        } else { "" }
+        $hwSec = if($D.Hardware -and ($D.Hardware.RAM -or $D.Hardware.GPU -or $D.Hardware.RAMSlots)){
+            "<details class='sec' open><summary><h2>&#x1F4BB; Hardware</h2></summary><table class='kv'>$hardwareHtml</table></details>"
+        } else { "" }
         $taskSec=if($tasksArr.Count-gt 0){"<details class='sec'><summary><h2>&#x23F0; Scheduled Tasks ($($tasksArr.Count))</h2></summary><table><tr><th>Name</th><th>Path</th><th>State</th><th>Last Run</th><th>Author</th></tr>$taskRows</table></details>"}else{""}
         $autoSec=if($autorunsArr.Count-gt 0){"<details class='sec'><summary><h2>&#x1F527; Autoruns ($($autorunsArr.Count))</h2></summary><table><tr><th>Type</th><th>Name</th><th>Location</th></tr>$autorunRows</table></details>"}else{""}
         $swSec=if($softwareArr.Count-gt 0){"<details class='sec'><summary><h2>&#x1F4E6; Installed Software ($($softwareArr.Count))</h2></summary><table><tr><th>Name</th><th>Version</th><th>Publisher</th></tr>$swRows</table></details>"}else{""}
@@ -2107,8 +2144,17 @@ $btnReport.Add_Click({
                 $bsodRows += "<tr><td class='$bCls'>$($b.Type)</td><td>$($b.Time)</td><td style='font-size:12px'>$bInfo</td></tr>"
             }
             $bsodReal = @($bsodArr2 | Where-Object { $_.Type -eq "BSOD" -or $_.Type -eq "MiniDump" -or $_.Type -eq "FullDump" })
-            $bsodHeader = if($bsodReal.Count -gt 0){"&#x26A0; BSOD / Crash Logs ($($bsodArr2.Count) entries)"}else{"BSOD / Crash Logs (No crashes)"}
-            $bsodOpenAttr = if($bsodReal.Count -gt 0){" open"}else{""}
+            $bsodUnexp = @($bsodArr2 | Where-Object { $_.Type -eq "UnexpectedShutdown" })
+            $bsodHeader = if($bsodReal.Count -gt 0 -and $bsodUnexp.Count -gt 0){
+                "&#x26A0; BSOD / Crash Logs ($($bsodReal.Count) BSODs, $($bsodUnexp.Count) unexpected shutdowns)"
+            } elseif($bsodReal.Count -gt 0){
+                "&#x26A0; BSOD / Crash Logs ($($bsodReal.Count) BSODs)"
+            } elseif($bsodUnexp.Count -gt 0){
+                "&#x26A0; BSOD / Crash Logs ($($bsodUnexp.Count) unexpected shutdowns)"
+            } else {
+                "BSOD / Crash Logs (No crashes)"
+            }
+            $bsodOpenAttr = if($bsodArr2.Count -gt 0){" open"}else{""}
             $bsodSec = "<details class='sec'$bsodOpenAttr><summary><h2>$bsodHeader</h2></summary><table><tr><th>Type</th><th>Time</th><th>Details</th></tr>$bsodRows</table></details>"
         } else {
             $bsodSec = "<details class='sec'><summary><h2>&#x1F4A4; BSOD / Crash Logs</h2></summary><p class='sok'>No crash dumps or BSOD events detected</p></details>"
@@ -2322,10 +2368,21 @@ $(
     }
 )
 $(
-    $cla = AsArray $Global:E.ChkdskLogs
+    $cla = @($Global:E.ChkdskLogs | Where-Object { $_ -ne $null })
     if($cla.Count -gt 0){
-        $clr=""; foreach($c in $cla){$clr+="<tr><td>$($c.Time)</td><td style='font-size:12px'>$([System.Web.HttpUtility]::HtmlEncode($c.Message))</td></tr>"}
-        "<details class='sec'><summary><h2>&#x1F4BE; Chkdsk Logs ($($cla.Count))</h2></summary><table><tr><th>Time</th><th>Message</th></tr>$clr</table></details>"
+        $clContent = ""
+        foreach($c in $cla){
+            $timeStr = if($c.Time){$c.Time}else{""}
+            $provStr = if($c.Provider){"[$([System.Web.HttpUtility]::HtmlEncode($c.Provider)) ID:$($c.EventID)]"}else{""}
+            $msgHtml = [System.Web.HttpUtility]::HtmlEncode($c.Message)
+            $clContent += "<div style='margin-bottom:16px;padding:12px;background:#0f172a;border-radius:6px;border-left:3px solid #60a5fa'>"
+            $clContent += "<div style='color:#60a5fa;font-size:12px;margin-bottom:6px'>$timeStr $provStr</div>"
+            $clContent += "<pre style='white-space:pre-wrap;font-size:11px;color:#e2e8f0;margin:0'>$msgHtml</pre>"
+            $clContent += "</div>"
+        }
+        "<details class='sec'><summary><h2>&#x1F4BE; Chkdsk Logs ($($cla.Count))</h2></summary>$clContent</details>"
+    } else {
+        "<details class='sec'><summary><h2>&#x1F4BE; Chkdsk Logs</h2></summary><p style='color:#94a3b8;padding:8px 0'>No chkdsk logs found. Run <code>chkdsk C: /f</code> and reboot to generate a report.</p></details>"
     }
 )
 $(
